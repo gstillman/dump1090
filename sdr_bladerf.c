@@ -301,6 +301,8 @@ void bladeRFRun()
 
     uint64_t sampleCounter = 0;
     pthread_mutex_lock(&Modes.data_mutex);
+
+    unsigned timeouts = 0;
     while (!Modes.exit) {
         pthread_mutex_unlock(&Modes.data_mutex);
 
@@ -316,11 +318,17 @@ void bladeRFRun()
         if (status < 0) {
             fprintf(stderr, "bladerf_sync_rx() failed: %s\n", bladerf_strerror(status));
             if (status == BLADERF_ERR_TIMEOUT) {
+                if (++timeouts == 5) {
+                    fprintf(stderr, "bladerf is wedged, giving up\n");
+                    break;
+                }
                 continue;
             }
 
             break;
         }
+
+        timeouts = 0;
 
         if (metadata.status & BLADERF_META_STATUS_OVERRUN) {
             fprintf(stderr, "bladerf_sync_rx(): overrun detected\n");
