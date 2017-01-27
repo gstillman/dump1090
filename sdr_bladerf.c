@@ -183,6 +183,7 @@ bool bladeRFOpen()
         fprintf(stderr, "bladerf: loading FPGA bitstream from %s\n", fpga_path);
         if ((status = bladerf_load_fpga(BladeRF.device, fpga_path)) < 0) {
             fprintf(stderr, "bladerf_load_fpga() failed: %s\n", bladerf_strerror(status));
+            goto error;
         }
     }
 
