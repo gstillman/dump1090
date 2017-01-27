@@ -26,6 +26,36 @@ struct converter_state {
     float z1_Q;
 };
 
+static uint16_t *uc8_lookup;
+static bool init_uc8_lookup()
+{
+    if (uc8_lookup)
+        return true;
+
+    uc8_lookup = malloc(sizeof(uint16_t) * 2048 * 2048);
+    if (!uc8_lookup) {
+        fprintf(stderr, "can't allocate UC8 conversion lookup table\n");
+        return false;
+    }
+
+    for (int i = 0; i <= 255; i++) {
+        for (int q = 0; q <= 255; q++) {
+            float fI, fQ, magsq;
+
+            fI = (i - 127.5) / 127.5;
+            fQ = (q - 127.5) / 127.5;
+            magsq = fI * fI + fQ * fQ;
+            if (magsq > 1)
+                magsq = 1;
+            float mag = sqrtf(magsq);
+
+            uc8_lookup[le16toh((i*256)+q)] = (uint16_t) (mag * 65535.0f + 0.5f);
+        }
+    }
+
+    return true;
+}
+
 static void convert_uc8_nodc(void *iq_data,
                              uint16_t *mag_data,
                              unsigned nsamples,
@@ -42,54 +72,32 @@ static void convert_uc8_nodc(void *iq_data,
     MODES_NOTUSED(state);
 
     // unroll this a bit
+
+#define DO_ONE_SAMPLE \
+    do {                                            \
+        mag = uc8_lookup[*in++];                    \
+        *mag_data++ = mag;                          \
+        sum_level += mag;                           \
+        sum_power += (uint32_t)mag * (uint32_t)mag; \
+    } while(0)
+
+    // unroll this a bit
     for (i = 0; i < (nsamples>>3); ++i) {
-        mag = Modes.maglut[*in++];
-        *mag_data++ = mag;
-        sum_level += mag;
-        sum_power += (uint32_t)mag * (uint32_t)mag;
-
-        mag = Modes.maglut[*in++];
-        *mag_data++ = mag;
-        sum_level += mag;
-        sum_power += (uint32_t)mag * (uint32_t)mag;
-
-        mag = Modes.maglut[*in++];
-        *mag_data++ = mag;
-        sum_level += mag;
-        sum_power += (uint32_t)mag * (uint32_t)mag;
-
-        mag = Modes.maglut[*in++];
-        *mag_data++ = mag;
-        sum_level += mag;
-        sum_power += (uint32_t)mag * (uint32_t)mag;
-
-        mag = Modes.maglut[*in++];
-        *mag_data++ = mag;
-        sum_level += mag;
-        sum_power += (uint32_t)mag * (uint32_t)mag;
-
-        mag = Modes.maglut[*in++];
-        *mag_data++ = mag;
-        sum_level += mag;
-        sum_power += (uint32_t)mag * (uint32_t)mag;
-
-        mag = Modes.maglut[*in++];
-        *mag_data++ = mag;
-        sum_level += mag;
-        sum_power += (uint32_t)mag * (uint32_t)mag;
-
-        mag = Modes.maglut[*in++];
-        *mag_data++ = mag;
-        sum_level += mag;
-        sum_power += (uint32_t)mag * (uint32_t)mag;
+        DO_ONE_SAMPLE;
+        DO_ONE_SAMPLE;
+        DO_ONE_SAMPLE;
+        DO_ONE_SAMPLE;
+        DO_ONE_SAMPLE;
+        DO_ONE_SAMPLE;
+        DO_ONE_SAMPLE;
+        DO_ONE_SAMPLE;
     }
 
     for (i = 0; i < (nsamples&7); ++i) {
-        mag = Modes.maglut[*in++];
-        *mag_data++ = mag;
-        sum_level += mag;
-        sum_power += (uint32_t)mag * (uint32_t)mag;
+        DO_ONE_SAMPLE;
     }
+
+#undef DO_ONE_SAMPLE
 
     if (out_mean_level) {
         *out_mean_level = sum_level / 65536.0 / nsamples;
@@ -346,7 +354,7 @@ static struct {
     bool (*init)();
 } converters_table[] = {
     // In order of preference
-    { INPUT_UC8,     0, convert_uc8_nodc,         "UC8, integer/table path", NULL },
+    { INPUT_UC8,     0, convert_uc8_nodc,         "UC8, integer/table path", init_uc8_lookup },
     { INPUT_UC8,     1, convert_uc8_generic,      "UC8, float path", NULL },
     { INPUT_SC16,    1, convert_sc16_generic,     "SC16, float path", NULL },
     { INPUT_SC16Q11, 0, convert_sc16q11_nodc,     "SC16Q11, integer/table path", init_sc16q11_lookup },
