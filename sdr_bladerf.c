@@ -16,6 +16,9 @@ static struct {
     unsigned lpf_bandwidth;
 
     struct bladerf *device;
+
+    iq_convert_fn converter;
+    struct converter_state *converter_state;
 } BladeRF;
 
 void bladeRFInitConfig()
@@ -239,6 +242,16 @@ bool bladeRFOpen()
     }
 
     show_config();
+
+    BladeRF.converter = init_converter(INPUT_SC16Q11,
+                                       Modes.sample_rate,
+                                       Modes.dc_filter,
+                                       &BladeRF.converter_state);
+    if (!BladeRF.converter) {
+        fprintf(stderr, "can't initialize sample converter\n");
+        goto error;
+    }
+
     return true;
 
  error:
@@ -249,157 +262,147 @@ bool bladeRFOpen()
     return false;
 }
 
+static struct timespec thread_cpu;
+
+static void *handle_bladerf_samples(struct bladerf *dev,
+                                    struct bladerf_stream *stream,
+                                    struct bladerf_metadata *meta,
+                                    void *samples,
+                                    size_t num_samples,
+                                    void *user_data)
+{
+    static uint64_t sampleCounter = 0;
+    static bool dropping = false;
+
+    MODES_NOTUSED(dev);
+    MODES_NOTUSED(stream);
+    MODES_NOTUSED(meta);
+    MODES_NOTUSED(user_data);
+
+    pthread_mutex_lock(&Modes.data_mutex);
+    if (Modes.exit) {
+        pthread_mutex_unlock(&Modes.data_mutex);
+        return BLADERF_STREAM_SHUTDOWN;
+    }
+
+    unsigned next_free_buffer = (Modes.first_free_buffer + 1) % MODES_MAG_BUFFERS;
+    struct mag_buf *outbuf = &Modes.mag_buffers[Modes.first_free_buffer];
+    struct mag_buf *lastbuf = &Modes.mag_buffers[(Modes.first_free_buffer + MODES_MAG_BUFFERS - 1) % MODES_MAG_BUFFERS];
+    unsigned free_bufs = (Modes.first_filled_buffer - next_free_buffer + MODES_MAG_BUFFERS) % MODES_MAG_BUFFERS;
+
+    if (free_bufs == 0 || (dropping && free_bufs < MODES_MAG_BUFFERS/2)) {
+        // FIFO is full. Drop this block.
+        sampleCounter += num_samples;
+        outbuf->dropped += num_samples;
+        dropping = true;
+        return samples;
+    }
+
+    // Compute the sample timestamp and system timestamp for the start of the block
+    outbuf->sampleTimestamp = sampleCounter * 12e6 / Modes.sample_rate;
+    unsigned block_duration = 1e9 * num_samples / Modes.sample_rate;
+    sampleCounter += num_samples;
+
+    // Get the approx system time for the start of this block
+    clock_gettime(CLOCK_REALTIME, &outbuf->sysTimestamp);
+    outbuf->sysTimestamp.tv_nsec -= block_duration;
+    normalize_timespec(&outbuf->sysTimestamp);
+
+    dropping = false;
+    pthread_mutex_unlock(&Modes.data_mutex);
+
+    // Copy trailing data from last block (or reset if not valid)
+    if (outbuf->dropped == 0) {
+        memcpy(outbuf->data, lastbuf->data + lastbuf->length, Modes.trailing_samples * sizeof(uint16_t));
+    } else {
+        memset(outbuf->data, 0, Modes.trailing_samples * sizeof(uint16_t));
+    }
+
+    // Convert the new data
+    outbuf->length = num_samples;
+    BladeRF.converter(samples, &outbuf->data[Modes.trailing_samples], num_samples, BladeRF.converter_state, &outbuf->mean_level, &outbuf->mean_power);
+
+    // Push the new data to the demodulation thread
+    pthread_mutex_lock(&Modes.data_mutex);
+
+    // accumulate CPU while holding the mutex, and restart measurement
+    end_cpu_timing(&thread_cpu, &Modes.reader_cpu_accumulator);
+    start_cpu_timing(&thread_cpu);
+
+    Modes.mag_buffers[next_free_buffer].dropped = 0;
+    Modes.mag_buffers[next_free_buffer].length = 0;  // just in case
+    Modes.first_free_buffer = next_free_buffer;
+
+    pthread_cond_signal(&Modes.data_cond);
+    pthread_mutex_unlock(&Modes.data_mutex);
+
+    return samples;
+}
+
+
 void bladeRFRun()
 {
     if (!BladeRF.device) {
         return;
     }
 
-    int buflen = MODES_MAG_BUF_SAMPLES;
-
-    unsigned ms_per_transfer = 1000 * buflen * 4 / Modes.sample_rate;
     unsigned transfers = 4;
 
     int status;
-    if ((status = bladerf_sync_config(BladeRF.device, BLADERF_MODULE_RX,
+    struct bladerf_stream *stream = NULL;
+    void **buffers = NULL;
+
+    if ((status = bladerf_init_stream(&stream,
+                                      BladeRF.device,
+                                      handle_bladerf_samples,
+                                      &buffers,
+                                      /* num_buffers */ transfers,
                                       BLADERF_FORMAT_SC16_Q11,
-                                      /* num_buffers */ transfers * 2,
-                                      /* buffer_size */ buflen * 4,
+                                      /* samples_per_buffer */ MODES_MAG_BUF_SAMPLES,
                                       /* num_transfers */ transfers,
-                                      /* stream_timeout, ms */ ms_per_transfer * (transfers + 2))) < 0) {
-        fprintf(stderr, "bladerf_sync_config() failed: %s\n", bladerf_strerror(status));
-        return;
+                                      /* user_data */ NULL)) < 0) {
+        fprintf(stderr, "bladerf_init_stream() failed: %s\n", bladerf_strerror(status));
+        goto out;
+    }
+
+    unsigned ms_per_transfer = 1000 * MODES_MAG_BUF_SAMPLES / Modes.sample_rate;
+    if ((status = bladerf_set_stream_timeout(BladeRF.device, BLADERF_MODULE_RX, ms_per_transfer * (transfers + 2))) < 0) {
+        fprintf(stderr, "bladerf_set_stream_timeout() failed: %s\n", bladerf_strerror(status));
+        goto out;
     }
 
     if ((status = bladerf_enable_module(BladeRF.device, BLADERF_MODULE_RX, true) < 0)) {
         fprintf(stderr, "bladerf_enable_module(RX, true) failed: %s\n", bladerf_strerror(status));
-        return;
+        goto out;
     }
 
-    void *buf = malloc(buflen * 4);
-    if (!buf) {
-        fprintf(stderr, "failed to allocate bladeRF sample buffer\n");
-        return;
-    }
-
-    struct converter_state *converter_state;
-    iq_convert_fn converter = init_converter(INPUT_SC16Q11,
-                                             Modes.sample_rate,
-                                             Modes.dc_filter,
-                                             &converter_state);
-    if (!converter) {
-        fprintf(stderr, "can't initialize sample converter\n");
-        free(buf);
-        return;
-    }
-
-    struct bladerf_metadata metadata;
-    bool dropping = false;
-
-    struct timespec thread_cpu;
     start_cpu_timing(&thread_cpu);
 
-    uint64_t sampleCounter = 0;
-    pthread_mutex_lock(&Modes.data_mutex);
-
-    unsigned timeouts = 0;
-    while (!Modes.exit) {
-        pthread_mutex_unlock(&Modes.data_mutex);
-
-        metadata.timestamp = 0;
-        metadata.flags = BLADERF_META_FLAG_RX_NOW;
-        status = bladerf_sync_rx(BladeRF.device,
-                                 buf, buflen,
-                                 &metadata,
-                                 1000);
-
-        pthread_mutex_lock(&Modes.data_mutex);
-
-        if (status < 0) {
-            fprintf(stderr, "bladerf_sync_rx() failed: %s\n", bladerf_strerror(status));
-            if (status == BLADERF_ERR_TIMEOUT) {
-                if (++timeouts == 5) {
-                    fprintf(stderr, "bladerf is wedged, giving up\n");
-                    break;
-                }
-                continue;
-            }
-
-            break;
-        }
-
-        timeouts = 0;
-
-        if (metadata.status & BLADERF_META_STATUS_OVERRUN) {
-            fprintf(stderr, "bladerf_sync_rx(): overrun detected\n");
-        }
-
-        unsigned next_free_buffer = (Modes.first_free_buffer + 1) % MODES_MAG_BUFFERS;
-        struct mag_buf *outbuf = &Modes.mag_buffers[Modes.first_free_buffer];
-        struct mag_buf *lastbuf = &Modes.mag_buffers[(Modes.first_free_buffer + MODES_MAG_BUFFERS - 1) % MODES_MAG_BUFFERS];
-        unsigned free_bufs = (Modes.first_filled_buffer - next_free_buffer + MODES_MAG_BUFFERS) % MODES_MAG_BUFFERS;
-
-        if (free_bufs == 0 || (dropping && free_bufs < MODES_MAG_BUFFERS/2)) {
-            // FIFO is full. Drop this block.
-            sampleCounter += metadata.actual_count;
-            outbuf->dropped += metadata.actual_count;
-            dropping = true;
-            continue;
-        }
-
-        // Compute the sample timestamp and system timestamp for the start of the block
-        outbuf->sampleTimestamp = sampleCounter * 12e6 / Modes.sample_rate;
-        unsigned block_duration = 1e9 * metadata.actual_count / Modes.sample_rate;
-        sampleCounter += metadata.actual_count;
-
-        // Get the approx system time for the start of this block
-        clock_gettime(CLOCK_REALTIME, &outbuf->sysTimestamp);
-        outbuf->sysTimestamp.tv_nsec -= block_duration;
-        normalize_timespec(&outbuf->sysTimestamp);
-
-        dropping = false;
-        pthread_mutex_unlock(&Modes.data_mutex);
-
-        // Copy trailing data from last block (or reset if not valid)
-        if (outbuf->dropped == 0) {
-            memcpy(outbuf->data, lastbuf->data + lastbuf->length, Modes.trailing_samples * sizeof(uint16_t));
-        } else {
-            memset(outbuf->data, 0, Modes.trailing_samples * sizeof(uint16_t));
-        }
-
-        // Convert the new data
-        outbuf->length = metadata.actual_count;
-        converter(buf, &outbuf->data[Modes.trailing_samples], metadata.actual_count, converter_state, &outbuf->mean_level, &outbuf->mean_power);
-
-        // Push the new data to the demodulation thread
-        pthread_mutex_lock(&Modes.data_mutex);
-
-        // accumulate CPU while holding the mutex, and restart measurement
-        end_cpu_timing(&thread_cpu, &Modes.reader_cpu_accumulator);
-        start_cpu_timing(&thread_cpu);
-
-        Modes.mag_buffers[next_free_buffer].dropped = 0;
-        Modes.mag_buffers[next_free_buffer].length = 0;  // just in case
-        Modes.first_free_buffer = next_free_buffer;
-
-        pthread_cond_signal(&Modes.data_cond);
+    if ((status = bladerf_stream(stream, BLADERF_MODULE_RX)) < 0) {
+        fprintf(stderr, "bladerf_stream() failed: %s\n", bladerf_strerror(status));
+        goto out;
     }
 
-    pthread_mutex_unlock(&Modes.data_mutex);
-    cleanup_converter(converter_state);
-    free(buf);
-
+ out:
     if ((status = bladerf_enable_module(BladeRF.device, BLADERF_MODULE_RX, false) < 0)) {
         fprintf(stderr, "bladerf_enable_module(RX, false) failed: %s\n", bladerf_strerror(status));
+    }
+
+    if (stream) {
+        bladerf_deinit_stream(stream);
     }
 }
 
 void bladeRFClose()
 {
-    if (!BladeRF.device) {
-        return;
+    if (BladeRF.converter) {
+        cleanup_converter(BladeRF.converter_state);
+        BladeRF.converter = NULL;
+        BladeRF.converter_state = NULL;
     }
 
-    bladerf_close(BladeRF.device);
-    BladeRF.device = NULL;
+    if (BladeRF.device) {
+        bladerf_close(BladeRF.device);
+        BladeRF.device = NULL;
+    }
 }
