@@ -295,6 +295,7 @@ static void *handle_bladerf_samples(struct bladerf *dev,
         sampleCounter += num_samples;
         outbuf->dropped += num_samples;
         dropping = true;
+        pthread_mutex_unlock(&Modes.data_mutex);
         return samples;
     }
 
