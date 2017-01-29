@@ -32,7 +32,7 @@ static bool init_uc8_lookup()
     if (uc8_lookup)
         return true;
 
-    uc8_lookup = malloc(sizeof(uint16_t) * 2048 * 2048);
+    uc8_lookup = malloc(sizeof(uint16_t) * 256 * 256);
     if (!uc8_lookup) {
         fprintf(stderr, "can't allocate UC8 conversion lookup table\n");
         return false;
