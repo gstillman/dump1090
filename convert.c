@@ -212,34 +212,6 @@ static void convert_sc16_generic(void *iq_data,
     }
 }
 
-static uint16_t *sc16q11_lookup;
-static bool init_sc16q11_lookup()
-{
-    if (sc16q11_lookup)
-        return true;
-
-    sc16q11_lookup = malloc(sizeof(uint16_t) * 2048 * 2048);
-    if (!sc16q11_lookup) {
-        fprintf(stderr, "can't allocate SC16Q11 conversion lookup table\n");
-        return false;
-    }
-
-    for (int i = 0; i < 2048; ++i) {
-        for (int q = 0; q < 2048; ++q) {
-            float fI = i / 2048.0, fQ = q / 2048.0;
-            float magsq = fI * fI + fQ * fQ;
-            if (magsq > 1)
-                magsq = 1;
-            float mag = sqrtf(magsq);
-
-            unsigned index = (i << 11) | q;
-            sc16q11_lookup[index] = (uint16_t)(mag * 65535.0f + 0.5f);
-        }
-    }
-
-    return true;
-}
-
 static void convert_sc16q11_nodc(void *iq_data,
                                  uint16_t *mag_data,
                                  unsigned nsamples,
@@ -247,50 +219,37 @@ static void convert_sc16q11_nodc(void *iq_data,
                                  double *out_mean_level,
                                  double *out_mean_power)
 {
-    uint16_t *in = iq_data;
-    unsigned i;
-    int16_t I, Q;
-    uint64_t sum_level = 0;
-    uint64_t sum_power = 0;
-    uint16_t mag;
-
     MODES_NOTUSED(state);
 
-    // unroll this a bit
+    uint16_t *in = iq_data;
 
-#define DO_ONE_SAMPLE \
-    do {                                            \
-        I = abs(le16toh(*in++)) & 2047;             \
-        Q = abs(le16toh(*in++)) & 2047;             \
-        mag = sc16q11_lookup[(I << 11) | Q];        \
-        *mag_data++ = mag;                          \
-        sum_level += mag;                           \
-        sum_power += (uint32_t)mag * (uint32_t)mag; \
-    } while(0)
+    unsigned i;
+    int16_t I, Q;
+    float fI, fQ, magsq;
+    float sum_level = 0, sum_power = 0;
 
-    for (i = 0; i < (nsamples>>3); ++i) {
-        DO_ONE_SAMPLE;
-        DO_ONE_SAMPLE;
-        DO_ONE_SAMPLE;
-        DO_ONE_SAMPLE;
-        DO_ONE_SAMPLE;
-        DO_ONE_SAMPLE;
-        DO_ONE_SAMPLE;
-        DO_ONE_SAMPLE;
+    for (i = 0; i < nsamples; ++i) {
+        I = (int16_t)le16toh(*in++);
+        Q = (int16_t)le16toh(*in++);
+        fI = I / 2048.0f;
+        fQ = Q / 2048.0f;
+
+        magsq = fI * fI + fQ * fQ;
+        if (magsq > 1)
+            magsq = 1;
+
+        float mag = sqrtf(magsq);
+        sum_power += magsq;
+        sum_level += mag;
+        *mag_data++ = (uint16_t)(mag * 65535.0f + 0.5f);
     }
-
-    for (i = 0; i < (nsamples&7); ++i) {
-        DO_ONE_SAMPLE;
-    }
-
-#undef DO_ONE_SAMPLE
 
     if (out_mean_level) {
-        *out_mean_level = sum_level / 65536.0 / nsamples;
+        *out_mean_level = sum_level / nsamples;
     }
 
     if (out_mean_power) {
-        *out_mean_power = sum_power / 65535.0 / 65535.0 / nsamples;
+        *out_mean_power = sum_power / nsamples;
     }
 }
 
@@ -357,9 +316,9 @@ static struct {
     { INPUT_UC8,     0, convert_uc8_nodc,         "UC8, integer/table path", init_uc8_lookup },
     { INPUT_UC8,     1, convert_uc8_generic,      "UC8, float path", NULL },
     { INPUT_SC16,    1, convert_sc16_generic,     "SC16, float path", NULL },
-    { INPUT_SC16Q11, 0, convert_sc16q11_nodc,     "SC16Q11, integer/table path", init_sc16q11_lookup },
+    { INPUT_SC16Q11, 0, convert_sc16q11_nodc,     "SC16Q11, float path, no DC", NULL },
     { INPUT_SC16Q11, 1, convert_sc16q11_generic,  "SC16Q11, float path", NULL },
-    { 0, 0, NULL, NULL, NULL }
+    { 0, 0, NULL, NULL, NULL },
 };
 
 iq_convert_fn init_converter(input_format_t format,
