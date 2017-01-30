@@ -263,6 +263,7 @@ bool bladeRFOpen()
 }
 
 static struct timespec thread_cpu;
+static unsigned timeouts = 0;
 
 static void *handle_bladerf_samples(struct bladerf *dev,
                                     struct bladerf_stream *stream,
@@ -278,6 +279,8 @@ static void *handle_bladerf_samples(struct bladerf *dev,
     MODES_NOTUSED(stream);
     MODES_NOTUSED(meta);
     MODES_NOTUSED(user_data);
+
+    timeouts = 0;
 
     pthread_mutex_lock(&Modes.data_mutex);
     if (Modes.exit) {
@@ -379,8 +382,15 @@ void bladeRFRun()
 
     start_cpu_timing(&thread_cpu);
 
+    timeouts = 0; // reset to zero when we get a callback with some data
+ retry:
     if ((status = bladerf_stream(stream, BLADERF_MODULE_RX)) < 0) {
         fprintf(stderr, "bladerf_stream() failed: %s\n", bladerf_strerror(status));
+        if (status == BLADERF_ERR_TIMEOUT) {
+            if (++timeouts < 5)
+                goto retry;
+            fprintf(stderr, "bladerf is wedged, giving up.\n");
+        }
         goto out;
     }
 
